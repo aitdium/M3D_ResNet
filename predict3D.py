@@ -1,0 +1,148 @@
+import torch
+import os
+import sys
+import json
+ 
+import torch.nn as nn
+import torch.optim as optim
+from torchvision import transforms, datasets
+from tqdm import tqdm
+from dataset import PET_images_3D, PET_images_3D_cut, RGB_images_3D_cut
+from dataset import CustomSubset
+# 训练M3D_ResNet
+import numpy as np
+from copy import deepcopy
+from tools.M3D_resnet_model import M3D_ResNet, Bottleneck, BasicBlock
+from train3D_modify import tp_tn_fp_fn, mcc
+ 
+def main():
+    # 如果有NVIDA显卡,转到GPU训练，否则用CPU
+    device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+    # device = 'cpu'
+ 
+    # 将多个transforms的操作整合在一起
+    data_transform = transforms.Compose(
+        [transforms.Resize(256),
+         transforms.CenterCrop(224),
+         transforms.ToTensor(),
+         transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])])
+ 
+    # 得到数据集的路径
+    image_path = '/home/zhaoqi/PET_CT/data/backup'
+    # 如果image_path不存在，序会抛出AssertionError错误，报错为参数内容“ ”
+    assert os.path.exists(image_path), "{} path does not exist.".format(image_path)
+    
+
+    # 一次测试载入16张图像
+    batch_size = 16
+    # 确定进程数
+    # min()：返回给定参数的最小值，参数可以为序列
+    # cpu_count()：返回一个整数值，表示系统中的CPU数量，如果不确定CPU的数量，则不返回任何内容
+    nw = min([os.cpu_count(), batch_size if batch_size > 1 else 0, 8])
+    print('Using {} dataloader workers every process'.format(nw))
+    model_path = '/home/Shujy/pth/M3D_ResNet/all4/all'
+    result_path = '/home/Shujy/pth/M3D_ResNet/result4/result_all2.txt'
+    i = 18
+    # g_num = 0
+    avg_acc,avg_jql,avg_zhl,avg_mcc = 0, 0, 0, 0
+    all_acc,all_jql,all_zhl,all_mcc=[],[],[],[]
+    models = os.listdir(model_path)
+    models.sort()
+    num = len(models)
+    for pth_fn in models[18:19]:
+        test_dataset = RGB_images_3D_cut(image_path,split='test',data_spilt=i,paths=[0,1,2])
+        test_size = len(test_dataset)
+        test_loader = torch.utils.data.DataLoader(test_dataset,
+                                               batch_size=batch_size, shuffle=True,
+                                               num_workers=nw)
+        pth_fn = os.path.join(model_path, pth_fn)
+        # 加载完整模型
+
+        model = M3D_ResNet(BasicBlock, [2, 2, 2, 2],block_num=4,shortcut_type='B',no_cuda=False,num_classes=2,include_top=True)
+        model.to(device)
+        weights_path = os.path.join(pth_fn,'M3D_ResNet.pth')
+        # 载入模型权重
+        # weights_path = "/home/Shujy/pth/M3D_ResNet/M3D_ResNet.pth"
+        # 确定模型存在，否则反馈错误
+        assert os.path.exists(pth_fn), "file: '{}' dose not exist.".format(weights_path)
+        # 加载训练好的模型参数
+        model.load_state_dict(torch.load(weights_path, map_location=lambda storage, loc: storage.cuda(1)))
+
+        # 测试
+        model.eval()
+        acc = 0.0
+        Mcc = 0.0
+        TP,TN,FP,FN = 0,0,0,0
+        # 清空历史梯度，与训练最大的区别是测试过程中取消了反向传播
+        with torch.no_grad():
+            test_bar = tqdm(test_loader, file=sys.stdout)
+            print(str(i)+":"+pth_fn)
+            for test_data in test_bar:
+                test_images, test_labels = test_data
+                outputs = model(test_images.to(device).float())
+                print(outputs)
+                # 函数会返回两个tensor，第一个tensor是每行的最大值；第二个tensor是每行最大值的索引
+                predict_y = torch.max(outputs, dim=1)[1]
+                # 对两个张量Tensor进行逐元素的比较，若相同位置的两个元素相同，则返回True；若不同，返回False
+                acc += torch.eq(predict_y, test_labels.to(device)).sum().item()
+                tp,tn,fp,fn = tp_tn_fp_fn(predict_y,test_labels.to(device))
+                TP+=tp
+                TN+=tn
+                FP+=fp
+                FN+=fn
+    
+            test_accurate = acc / test_size
+
+            print('test_accuracy: %.3f' %
+                (test_accurate))
+            with open(result_path, 'a') as f:
+                f.write('{}: \n'.format(i))
+                f.write('tp-{}, tn-{}, fp-{}, fn-{}\n'.format(TP,TN,FP,FN))
+                jql = 0 if TP+FP == 0 else TP/(TP+FP)
+                zhl = 0 if TP+FN == 0 else TP/(TP+FN)
+                test_Mcc = mcc(TP, TN, FP, FN)
+                f.write('acc-{},jql-{},zhl-{},mcc-{}\n'.format(test_accurate,jql,zhl,test_Mcc))
+                f.write('\n')
+            i+=1
+            avg_mcc += test_Mcc
+            avg_acc += test_accurate
+            avg_jql += jql
+            avg_zhl += zhl
+            if test_accurate > 0.55:
+                # avg_acc+=test_accurate
+                # avg_jql+=TP/(TP+FP)
+                # avg_zhl+=TP/(TP+FN)
+                all_acc.append(test_accurate)
+                all_jql.append(jql)
+                all_zhl.append(zhl)
+                all_mcc.append(test_Mcc)
+                # g_num+=1
+            if i>num:
+                break
+    
+    avg_acc2 = sum(all_acc)/len(all_acc)
+    avg_jql2 = sum(all_jql)/len(all_jql)
+    avg_zhl2 = sum(all_zhl)/len(all_zhl)
+    avg_mcc2 = sum(all_mcc)/len(all_mcc)
+    print('avg_acc:{},avg_jql:{},avg_zhl:{}'.format(avg_acc,avg_jql,avg_zhl))
+    std_acc = sum([(i-avg_acc2)**2 for i in all_acc])/len(all_zhl)
+    std_jql = sum([(i-avg_jql2)**2 for i in all_jql])/len(all_zhl)
+    std_zhl = sum([(i-avg_zhl2)**2 for i in all_zhl])/len(all_zhl)
+    std_mcc = sum([(i-avg_mcc2)**2 for i in all_mcc])/len(all_zhl)
+    print('std_acc:{},std_jql:{},std_zhl:{},std_mcc:{}'.format(std_acc,std_jql,std_zhl,std_mcc))
+    with open(result_path, 'a') as f:
+        f.write('\n')
+        f.write('all_acc:{}\n'.format(all_acc))
+        f.write('all_jql:{}\n'.format(all_jql))
+        f.write('all_zhl:{}\n'.format(all_zhl))
+        f.write('all_mcc:{}\n'.format(all_mcc))
+        f.write('num:{}\n'.format(len(all_mcc)))
+        f.write('avg_acc:{},avg_jql:{},avg_zhl:{},avg_mcc:{}\n'.format(avg_acc2,avg_jql2,avg_zhl2,avg_mcc2))
+        f.write('std_acc:{},std_jql:{},std_zhl:{},std_mcc:{}\n'.format(std_acc,std_jql,std_zhl,std_mcc))
+        f.write('avg_acc:{},avg_jql:{},avg_zhl:{},avg_mcc:{}\n'.format(avg_acc/num,avg_jql/num,avg_zhl/num,avg_mcc/num))
+        f.write('\n')
+
+ 
+ 
+if __name__ == '__main__':
+    main()
